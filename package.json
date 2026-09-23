@@ -1,6 +1,6 @@
 {
   "name": "dsh-ollama-control",
-  "version": "0.1.0",
+  "version": "0.2.0-alpha.1",
   "description": "A protected DSH Web header control for a managed local Ollama service.",
   "type": "module",
   "main": "index.js",

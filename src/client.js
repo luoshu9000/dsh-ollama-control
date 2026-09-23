@@ -1,51 +1,178 @@
-import { createElement, useEffect, useRef, useState } from 'react'
+import { createElement } from 'react'
+import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 
-const STATUS_ROUTE = '/ollama-control/status'
+const MODELS_ROUTE = '/ollama-control/models'
 const TOGGLE_ROUTE = '/ollama-control/toggle'
+const LOAD_ROUTE = '/ollama-control/load'
+
+function sameModels(left, right) {
+  return left.length === right.length && left.every((item, index) => {
+    const other = right[index]
+    return item.model === other.model && item.displayName === other.displayName &&
+      item.installed === other.installed && item.registered === other.registered &&
+      item.canLoad === other.canLoad && item.loaded === other.loaded
+  })
+}
+
+class OllamaControlController {
+  constructor() {
+    this.view = createSnapshotStore({
+      service: 'unknown', busy: false, models: [], selected: '',
+      dialogOwner: null, message: '', error: false,
+    })
+    this.pending = false
+    this.disposed = false
+    this.abort = new AbortController()
+    this.refreshing = null
+    this.timer = null
+  }
+
+  publish(change) {
+    if (this.disposed) return
+    const current = this.view.getSnapshot()
+    if (change.models && sameModels(current.models, change.models)) change = { ...change, models: current.models }
+    if (Object.entries(change).every(([key, value]) => Object.is(current[key], value))) return
+    this.view.set({ ...current, ...change })
+  }
+
+  start() {
+    void this.refresh()
+    this.timer = setInterval(() => { void this.refresh() }, 10_000)
+  }
+
+  stop() {
+    this.disposed = true
+    clearInterval(this.timer)
+    this.abort.abort()
+  }
+
+  refresh() {
+    if (this.refreshing) return this.refreshing
+    this.refreshing = (async () => {
+      try {
+        const response = await fetch(MODELS_ROUTE, { cache: 'no-store', signal: this.abort.signal })
+        if (!response.ok) throw new Error('无法读取本地 Ollama 状态。')
+        const body = await response.json()
+        const models = Array.isArray(body.models) ? body.models : []
+        const service = body.service?.state ?? 'unknown'
+        const current = this.view.getSnapshot()
+        const selected = models.some(item => item.model === current.selected && item.canLoad)
+          ? current.selected : (models.find(item => item.canLoad)?.model ?? '')
+        this.publish({ service, models, selected, busy: this.pending || body.service?.busy === true })
+      } catch (error) {
+        if (!this.disposed) this.publish({ service: 'unknown', busy: this.pending, error: true, message: error.message })
+      }
+    })().finally(() => { this.refreshing = null })
+    return this.refreshing
+  }
+
+  open(owner) {
+    this.publish({ dialogOwner: owner, message: '', error: false })
+    void this.refresh()
+  }
+
+  close() { this.publish({ dialogOwner: null }) }
+  choose(model) { this.publish({ selected: model }) }
+
+  async post(route, payload, success) {
+    if (this.pending || this.view.getSnapshot().busy) return
+    this.pending = true
+    this.publish({ busy: true, message: '正在处理，请稍候…', error: false })
+    try {
+      const response = await fetch(route, {
+        method: 'POST', cache: 'no-store', signal: this.abort.signal,
+        ...(payload === undefined ? {} : {
+          headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload),
+        }),
+      })
+      const body = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(body.message || `HTTP ${response.status}`)
+      this.publish({ message: success, error: false })
+    } catch (error) {
+      if (!this.disposed) this.publish({ message: error.message, error: true })
+    } finally {
+      this.pending = false
+      // A poll started before the operation may have captured stale state.
+      if (this.refreshing) await this.refreshing
+      await this.refresh()
+    }
+  }
+
+  toggle() {
+    const { service } = this.view.getSnapshot()
+    if (service !== 'managed' && service !== 'stopped') return
+    return this.post(TOGGLE_ROUTE, undefined, service === 'managed' ? 'Ollama 已停止。' : 'Ollama 已启动。')
+  }
+
+  load() {
+    const { selected, models } = this.view.getSnapshot()
+    if (!models.some(item => item.model === selected && item.canLoad)) return
+    return this.post(LOAD_ROUTE, { model: selected }, '模型已加载；对话模型仍需在聊天框中选择。')
+  }
+}
 
 function Icon({ state }) {
   const common = { fill: 'none', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round' }
-  if (state === 'running') return createElement('svg', { width: 16, height: 16, viewBox: '0 0 16 16', 'aria-hidden': true }, createElement('rect', { x: 3.1, y: 3.1, width: 9.8, height: 9.8, rx: 1.4, fill: 'currentColor' }))
+  if (state === 'managed') return createElement('svg', { width: 16, height: 16, viewBox: '0 0 16 16', 'aria-hidden': true }, createElement('rect', { x: 3.1, y: 3.1, width: 9.8, height: 9.8, rx: 1.4, fill: 'currentColor' }))
   if (state === 'busy') return createElement('svg', { width: 16, height: 16, viewBox: '0 0 16 16', 'aria-hidden': true }, createElement('g', null, createElement('animateTransform', { attributeName: 'transform', type: 'rotate', from: '0 8 8', to: '360 8 8', dur: '0.8s', repeatCount: 'indefinite' }), createElement('path', { d: 'M13.2 8a5.2 5.2 0 1 1-1.52-3.68', ...common }), createElement('path', { d: 'M11.68 1.9v2.9H8.78', ...common })))
   return createElement('svg', { width: 16, height: 16, viewBox: '0 0 16 16', 'aria-hidden': true }, createElement('circle', { cx: 8, cy: 8, r: 6.2, ...common }), createElement('path', { d: 'm6.6 5.55 4.05 2.45-4.05 2.45z', fill: 'currentColor', stroke: 'none' }))
 }
 
-async function status() {
-  const response = await fetch(STATUS_ROUTE, { cache: 'no-store' })
-  if (!response.ok) throw new Error('status request failed')
-  return (await response.json()).running === true
-}
-
-function OllamaControlAction() {
-  const [running, setRunning] = useState(false)
-  const [known, setKnown] = useState(false)
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState(false)
-  const mounted = useRef(true)
-  useEffect(() => {
-    mounted.current = true
-    const refresh = () => status().then(value => { if (mounted.current) { setRunning(value); setKnown(true); setError(false) } }, () => { if (mounted.current) { setKnown(true); setError(true) } })
-    void refresh()
-    const timer = setInterval(() => { void refresh() }, 10_000)
-    return () => { mounted.current = false; clearInterval(timer) }
-  }, [])
-  const toggle = async () => {
-    if (busy) return
-    setBusy(true); setError(false)
-    try {
-      const response = await fetch(TOGGLE_ROUTE, { method: 'POST', cache: 'no-store' })
-      const body = await response.json().catch(() => ({}))
-      if (!response.ok || typeof body.running !== 'boolean') throw new Error('toggle request failed')
-      if (mounted.current) { setRunning(body.running); setKnown(true) }
-    } catch { if (mounted.current) setError(true) } finally { if (mounted.current) setBusy(false) }
-  }
-  const state = busy ? 'busy' : known && running ? 'running' : 'stopped'
-  const label = busy ? (running ? '正在停止 Ollama' : '正在启动 Ollama') : error ? 'Ollama 操作失败；请查看日志' : running ? 'Ollama 已运行，点击停止' : 'Ollama 已停止，点击启动'
-  const color = busy ? 'var(--dsw-alias-label-secondary)' : running ? 'var(--dsw-alias-state-success-primary, #32a467)' : 'var(--dsw-alias-state-error-primary, #e5484d)'
-  return createElement('button', { type: 'button', disabled: busy, onClick: () => { void toggle() }, 'aria-label': label, title: label, style: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: '26px', height: '26px', padding: 0, border: '0.5px solid var(--dsw-alias-border-l4)', borderRadius: '13px', background: 'transparent', color, cursor: busy ? 'wait' : 'pointer', opacity: busy ? 0.65 : 1 } }, createElement(Icon, { state }))
+function OllamaControlAction(props) {
+  const view = props.useOllamaControl(state => state)
+  const state = view.busy ? 'busy' : view.service
+  const label = view.service === 'external' ? '端口由外部 Ollama 占用，插件不能停止或加载模型'
+    : view.service === 'managed' ? '本地 Ollama 已运行，打开模型控制'
+      : view.service === 'stopped' ? '本地 Ollama 已停止，打开模型控制' : '正在检查本地 Ollama'
+  const color = view.service === 'external' ? '#b7791f'
+    : view.service === 'managed' ? 'var(--dsw-alias-state-success-primary, #32a467)'
+      : 'var(--dsw-alias-state-error-primary, #e5484d)'
+  const button = createElement('button', {
+    type: 'button', disabled: view.busy, onClick: () => props.open(props.owner),
+    'aria-label': label, title: label,
+    style: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: '26px', height: '26px', padding: 0, border: '0.5px solid var(--dsw-alias-border-l4)', borderRadius: '13px', background: 'transparent', color, cursor: view.busy ? 'wait' : 'pointer' },
+  }, createElement(Icon, { state }))
+  if (view.dialogOwner !== props.owner) return button
+  const choices = view.models.length === 0
+    ? createElement('p', null, '没有已登记的本地 Ollama 模型。')
+    : createElement('div', { style: { display: 'grid', gap: '8px', margin: '12px 0' } }, ...view.models.map(item => createElement('label', {
+      key: item.model, style: { display: 'flex', gap: '8px', padding: '8px', border: '1px solid var(--dsw-alias-border-l4)', borderRadius: '6px', opacity: item.canLoad ? 1 : 0.55 },
+    }, createElement('input', {
+      type: 'radio', name: 'ollama-model', disabled: !item.canLoad,
+      checked: view.selected === item.model, onChange: () => props.choose(item.model),
+    }), createElement('span', null, createElement('strong', null, item.displayName), createElement('br'), createElement('small', null,
+      `${item.model} · ${item.canLoad ? '可尝试加载' : item.installed ? '当前服务不可加载' : '未安装'}${item.loaded ? ' · 已驻留' : ''}`)))))
+  return createElement('span', null, button, createElement('div', {
+    role: 'dialog', 'aria-modal': true, 'aria-label': '本地 Ollama 模型',
+    style: { position: 'fixed', zIndex: 1000, inset: 0, display: 'grid', placeItems: 'center', background: 'rgba(0,0,0,.45)' },
+  }, createElement('div', {
+    style: { width: 'min(520px, calc(100vw - 32px))', padding: '18px', borderRadius: '10px', background: 'var(--dsw-alias-background-default, #fff)', color: 'var(--dsw-alias-label-primary, #111)', boxShadow: '0 16px 48px rgba(0,0,0,.3)' },
+  }, createElement('h3', { style: { margin: 0 } }, '本地 Ollama 模型'),
+  createElement('p', null, view.service === 'external'
+    ? '检测到外部 Ollama 占用 11434。请先在原启动方式中停止它。'
+    : '请选择模型进行预加载；是否支持对话需另行验证。'),
+  choices,
+  view.message && createElement('p', { role: 'status' }, view.message),
+  createElement('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: '8px', marginTop: '16px' } },
+    view.service === 'managed' && createElement('button', { type: 'button', disabled: view.busy, onClick: props.toggle }, '停止 Ollama'),
+    createElement('button', { type: 'button', disabled: view.busy, onClick: props.close }, '关闭'),
+    createElement('button', { type: 'button', disabled: view.busy || !view.selected, onClick: props.load }, view.busy ? '处理中…' : '启动并加载')))))
 }
 
 export const inject = ['slots']
 export function apply(ctx) {
-  ctx.slots.inject('conversation.session.header.utilities', () => ctx.slots.register({ name: 'conversation.session.header.utilities', id: 'ollama-control', order: -20 }, OllamaControlAction))
+  const controller = new OllamaControlController()
+  ctx.effect(() => { controller.start(); return () => controller.stop() }, 'ollama-control: shared browser controller')
+  const face = owner => () => ({
+    owner, hooks: { ollamaControl: controller.view },
+    open: value => controller.open(value), close: () => controller.close(),
+    choose: model => controller.choose(model), toggle: () => controller.toggle(), load: () => controller.load(),
+  })
+  ctx.slots.inject('conversation.header.leading', () => ctx.slots.register({
+    name: 'conversation.header.leading', inject: face('root'),
+  }, OllamaControlAction))
+  ctx.slots.inject('conversation.session.header.utilities', () => ctx.slots.register({
+    name: 'conversation.session.header.utilities', id: 'ollama-control', order: -20,
+    inject: face('session'),
+  }, OllamaControlAction))
 }
